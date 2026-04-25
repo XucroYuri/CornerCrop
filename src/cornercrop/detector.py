@@ -4,36 +4,9 @@ from __future__ import annotations
 
 import os
 import sys
-from dataclasses import dataclass
 from typing import List
 
-from Foundation import NSURL, NSMutableDictionary
-from Vision import (
-    VNRecognizeTextRequest,
-    VNImageRequestHandler,
-    VNRequestTextRecognitionLevelAccurate,
-)
-
-
-@dataclass
-class TextRegion:
-    """A detected text region with bounding box."""
-
-    text: str
-    confidence: float
-    # Normalized bbox (0-1), Vision convention: origin bottom-left
-    bbox_x: float
-    bbox_y: float
-    bbox_w: float
-    bbox_h: float
-
-    def to_pixel(self, img_w: int, img_h: int) -> dict:
-        """Convert normalized bbox to pixel coords (top-left origin)."""
-        px_x = int(self.bbox_x * img_w)
-        px_y = int((1.0 - self.bbox_y - self.bbox_h) * img_h)
-        px_w = int(self.bbox_w * img_w)
-        px_h = int(self.bbox_h * img_h)
-        return {"x": px_x, "y": px_y, "w": px_w, "h": px_h}
+from .models import TextRegion
 
 
 def detect_text(image_path: str, min_confidence: float = 0.3) -> List[TextRegion]:
@@ -47,6 +20,19 @@ def detect_text(image_path: str, min_confidence: float = 0.3) -> List[TextRegion
     Returns:
         List of TextRegion objects.
     """
+    try:
+        from Foundation import NSURL, NSMutableDictionary
+        from Vision import (
+            VNImageRequestHandler,
+            VNRecognizeTextRequest,
+            VNRequestTextRecognitionLevelAccurate,
+        )
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Vision.framework bindings are unavailable. Install CornerCrop's "
+            "PyObjC dependencies on macOS before running OCR."
+        ) from exc
+
     url = NSURL.fileURLWithPath_(os.path.abspath(image_path))
     handler = VNImageRequestHandler.alloc().initWithURL_options_(
         url, NSMutableDictionary.dictionary()
