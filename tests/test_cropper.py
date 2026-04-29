@@ -7,14 +7,16 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
+from cornercrop.batch import AdaptiveParallelismConfig, process_batch
 from cornercrop.cli import main
 from cornercrop.cropper import (
     BrandingCandidate,
@@ -32,6 +34,24 @@ from cornercrop.pipeline import (
     ResidualTextMatch,
     VerificationStatus,
     process_image,
+)
+from cornercrop.library_runner import (
+    ArchiveReason,
+    ImageAction,
+    JobDatabase,
+    LibraryRunConfig,
+    _process_image_path,
+    _process_album,
+    build_image_decision,
+    iter_album_dirs,
+    safe_archive_path,
+)
+from cornercrop.non_corner_recovery import (
+    RecoveryConfig,
+    album_dir_for_archive_image,
+    iter_non_corner_archive_images,
+    recover_image,
+    safe_recovered_path,
 )
 
 
@@ -101,6 +121,18 @@ class TestBrandingRules(unittest.TestCase):
         self.assertIn("copyright", rules)
         self.assertIn("brand", rules)
         self.assertIn("issue_id", rules)
+
+    def test_matched_branding_rules_detects_common_album_brands(self):
+        samples = [
+            "XINGYAN星颜社 VOL.025",
+            "HuaYang花漾 Vol.270",
+            "MFStar模范学院 Vol.383",
+            "YiTuYu艺图语 Vol.8874",
+        ]
+
+        for sample in samples:
+            with self.subTest(sample=sample):
+                self.assertIn("brand", matched_branding_rules(sample))
 
     def test_find_branding_candidates_uses_content_and_position(self):
         regions = [
@@ -383,6 +415,321 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(override_mock.call_count, 1)
         self.assertIn("Fallback crop applied", stdout.getvalue())
+
+
+class TestLibraryRunnerPolicy(unittest.TestCase):
+    def test_iter_album_dirs_finds_image_dirs_and_ignores_archives(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = os.path.join(tmpdir, "Model")
+            album_dir = os.path.join(model_dir, "Album")
+            archive_dir = os.path.join(album_dir, "_cornercrop_archive", "non_corner_watermark")
+            empty_dir = os.path.join(model_dir, "Empty")
+            os.makedirs(archive_dir, exist_ok=True)
+            os.makedirs(empty_dir, exist_ok=True)
+            _create_test_image(os.path.join(album_dir, "001.jpg"))
+            _create_test_image(os.path.join(archive_dir, "archived.jpg"))
+
+            albums = list(iter_album_dirs(model_dir))
+
+        self.assertEqual(albums, [album_dir])
+
+    def test_build_image_decision_skips_when_no_watermark_candidates(self):
+        result = _result(
+            "sample.jpg",
+            branding_candidates=[],
+            original_size=(1000, 1000),
+            output_size=(1000, 1000),
+        )
+
+        decision = build_image_decision(result, max_removed_area_ratio=0.30)
+
+        self.assertEqual(decision.action, ImageAction.SKIP)
+
+    def test_build_image_decision_crops_corner_watermark_under_limit(self):
+        candidate = _candidate(
+            "XIUREN",
+            anchors=["bottom", "right"],
+            bbox={"x": 900, "y": 940, "w": 80, "h": 30},
+            corners=[Corner.BOTTOM_RIGHT],
+        )
+        result = _result(
+            "sample.jpg",
+            selected_profile=CropProfile.CORNER,
+            branding_candidates=[candidate],
+            original_size=(1000, 1000),
+            output_size=(900, 900),
+        )
+
+        decision = build_image_decision(result, max_removed_area_ratio=0.30)
+
+        self.assertEqual(decision.action, ImageAction.CROP)
+        self.assertAlmostEqual(decision.removed_area_ratio, 0.19)
+
+    def test_build_image_decision_archives_non_corner_watermark(self):
+        candidate = _candidate(
+            "XIUREN",
+            anchors=["top"],
+            bbox={"x": 420, "y": 10, "w": 160, "h": 30},
+            corners=[],
+        )
+        result = _result(
+            "sample.jpg",
+            branding_candidates=[candidate],
+            original_size=(1000, 1000),
+            output_size=(1000, 940),
+        )
+
+        decision = build_image_decision(result, max_removed_area_ratio=0.30)
+
+        self.assertEqual(decision.action, ImageAction.ARCHIVE)
+        self.assertEqual(decision.archive_reason, ArchiveReason.NON_CORNER_WATERMARK)
+
+    def test_build_image_decision_archives_excessive_removed_area(self):
+        candidate = _candidate(
+            "XIUREN",
+            anchors=["top", "left"],
+            bbox={"x": 0, "y": 0, "w": 320, "h": 320},
+            corners=[Corner.TOP_LEFT],
+        )
+        result = _result(
+            "sample.jpg",
+            branding_candidates=[candidate],
+            original_size=(1000, 1000),
+            output_size=(800, 800),
+        )
+
+        decision = build_image_decision(result, max_removed_area_ratio=0.30)
+
+        self.assertEqual(decision.action, ImageAction.ARCHIVE)
+        self.assertEqual(decision.archive_reason, ArchiveReason.EXCESSIVE_CROP_AREA)
+
+    def test_safe_archive_path_keeps_conflicting_names(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            archive_dir = os.path.join(tmpdir, "archive")
+            os.makedirs(archive_dir, exist_ok=True)
+            existing = os.path.join(archive_dir, "001.jpg")
+            _create_test_image(existing)
+
+            resolved = safe_archive_path(os.path.join(tmpdir, "001.jpg"), archive_dir)
+
+        self.assertTrue(resolved.endswith("001__cornercrop_1.jpg"))
+
+    def test_process_image_path_archives_unreadable_image(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            album_dir = os.path.join(tmpdir, "Album")
+            os.makedirs(album_dir, exist_ok=True)
+            image_path = os.path.join(album_dir, "broken.jpg")
+            with open(image_path, "wb") as handle:
+                handle.write(b"not an image")
+            db = JobDatabase(os.path.join(tmpdir, "state", "job.sqlite3"))
+            config = LibraryRunConfig(root=tmpdir, state_dir=os.path.join(tmpdir, "state"))
+            try:
+                with mock.patch(
+                    "cornercrop.library_runner.inspect_image",
+                    side_effect=UnidentifiedImageError("cannot identify image file"),
+                ):
+                    action = _process_image_path(album_dir, image_path, config, db)
+                row = db._connection.execute(
+                    "SELECT action, reason, output_path, error FROM images WHERE path = ?",
+                    (image_path,),
+                ).fetchone()
+                archive_exists = os.path.exists(row["output_path"])
+            finally:
+                db.close()
+
+            self.assertEqual(action, "archived")
+            self.assertEqual(row["action"], "archived")
+            self.assertEqual(row["reason"], ArchiveReason.UNREADABLE_IMAGE.value)
+            self.assertIsNone(row["error"])
+            self.assertFalse(os.path.exists(image_path))
+            self.assertTrue(archive_exists)
+
+    def test_process_album_records_album_failure_without_stopping_batch(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            album_dir = os.path.join(tmpdir, "Album")
+            os.makedirs(album_dir, exist_ok=True)
+            _create_test_image(os.path.join(album_dir, "001.jpg"))
+            db = JobDatabase(os.path.join(tmpdir, "state", "job.sqlite3"))
+            config = LibraryRunConfig(root=tmpdir, state_dir=os.path.join(tmpdir, "state"), dry_run=True)
+            try:
+                with mock.patch(
+                    "cornercrop.library_runner._process_image_path",
+                    side_effect=RuntimeError("album worker boom"),
+                ):
+                    counts = _process_album(album_dir, config, db)
+                row = db._connection.execute(
+                    "SELECT status, error FROM albums WHERE path = ?",
+                    (album_dir,),
+                ).fetchone()
+            finally:
+                db.close()
+
+        self.assertEqual(counts["processed"], 0)
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("album worker boom", row["error"])
+
+    def test_process_album_marks_partial_stop_without_claiming_done(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            album_dir = os.path.join(tmpdir, "Album")
+            os.makedirs(album_dir, exist_ok=True)
+            _create_test_image(os.path.join(album_dir, "001.jpg"))
+            stop_file = os.path.join(tmpdir, "STOP")
+            open(stop_file, "w", encoding="utf-8").close()
+            db = JobDatabase(os.path.join(tmpdir, "state", "job.sqlite3"))
+            config = LibraryRunConfig(
+                root=tmpdir,
+                state_dir=os.path.join(tmpdir, "state"),
+                dry_run=True,
+                stop_file=stop_file,
+            )
+            try:
+                counts = _process_album(album_dir, config, db)
+                row = db._connection.execute(
+                    "SELECT status, processed, total FROM albums WHERE path = ?",
+                    (album_dir,),
+                ).fetchone()
+            finally:
+                db.close()
+
+        self.assertEqual(counts["processed"], 0)
+        self.assertEqual(row["status"], "stopped")
+        self.assertEqual(row["processed"], 0)
+        self.assertEqual(row["total"], 1)
+
+
+class TestNonCornerRecovery(unittest.TestCase):
+    def test_iter_non_corner_archive_images_finds_only_reason_dir_images(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            album_dir = os.path.join(tmpdir, "Model", "Album")
+            reason_dir = os.path.join(album_dir, "_cornercrop_archive", "non_corner_watermark")
+            other_archive = os.path.join(album_dir, "_cornercrop_archive", "excessive_crop_area")
+            os.makedirs(reason_dir, exist_ok=True)
+            os.makedirs(other_archive, exist_ok=True)
+            wanted = _create_test_image(os.path.join(reason_dir, "001.jpg"))
+            _create_test_image(os.path.join(other_archive, "002.jpg"))
+            _create_test_image(os.path.join(album_dir, "003.jpg"))
+
+            images = list(iter_non_corner_archive_images(tmpdir))
+
+        self.assertEqual(images, [os.path.abspath(wanted)])
+
+    def test_recover_image_saves_cropped_output_to_album_and_removes_archive_source(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            album_dir = os.path.join(tmpdir, "Album")
+            reason_dir = os.path.join(album_dir, "_cornercrop_archive", "non_corner_watermark")
+            os.makedirs(reason_dir, exist_ok=True)
+            source_path = _create_test_image(os.path.join(reason_dir, "001.jpg"), 800, 600)
+            config = RecoveryConfig(root=tmpdir, state_dir=os.path.join(tmpdir, "state"))
+            regions = [TextRegion("XIUREN", 0.9, 0.35, 0.92, 0.2, 0.05)]
+
+            with mock.patch("cornercrop.non_corner_recovery._collect_text_regions", return_value=regions):
+                with mock.patch(
+                    "cornercrop.non_corner_recovery._verify_processed_image",
+                    return_value=(VerificationStatus.CLEAN, []),
+                ):
+                    result = recover_image(source_path, config)
+
+            self.assertEqual(result.action, "recovered")
+            self.assertEqual(album_dir_for_archive_image(source_path), album_dir)
+            self.assertFalse(os.path.exists(source_path))
+            self.assertTrue(os.path.exists(result.output_path))
+            with Image.open(result.output_path) as recovered:
+                self.assertLess(recovered.size[1], 600)
+
+    def test_recover_image_keeps_source_when_verification_finds_residual_branding(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            album_dir = os.path.join(tmpdir, "Album")
+            reason_dir = os.path.join(album_dir, "_cornercrop_archive", "non_corner_watermark")
+            os.makedirs(reason_dir, exist_ok=True)
+            source_path = _create_test_image(os.path.join(reason_dir, "001.jpg"), 800, 600)
+            config = RecoveryConfig(root=tmpdir, state_dir=os.path.join(tmpdir, "state"))
+            regions = [TextRegion("XIUREN", 0.9, 0.35, 0.92, 0.2, 0.05)]
+            residual = ResidualTextMatch(
+                source="top",
+                text="XIUREN",
+                confidence=0.9,
+                matched_rules=["brand"],
+                px_bbox={"x": 10, "y": 10, "w": 80, "h": 30},
+            )
+
+            with mock.patch("cornercrop.non_corner_recovery._collect_text_regions", return_value=regions):
+                with mock.patch(
+                    "cornercrop.non_corner_recovery._verify_processed_image",
+                    return_value=(VerificationStatus.RESIDUAL, [residual]),
+                ):
+                    result = recover_image(source_path, config)
+
+            self.assertEqual(result.action, "kept")
+            self.assertEqual(result.reason, "residual_watermark_after_second_pass_crop")
+            self.assertTrue(os.path.exists(source_path))
+            self.assertIsNone(result.output_path)
+
+    def test_safe_recovered_path_keeps_conflicting_album_names(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            album_dir = os.path.join(tmpdir, "Album")
+            reason_dir = os.path.join(album_dir, "_cornercrop_archive", "non_corner_watermark")
+            os.makedirs(reason_dir, exist_ok=True)
+            _create_test_image(os.path.join(album_dir, "001.jpg"))
+            source_path = _create_test_image(os.path.join(reason_dir, "001.jpg"))
+
+            resolved = safe_recovered_path(source_path, album_dir)
+
+        self.assertTrue(resolved.endswith("001__cornercrop_recovered_1.jpg"))
+
+    def test_recover_image_prefers_lower_area_clean_crop_across_profiles(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            album_dir = os.path.join(tmpdir, "Album")
+            reason_dir = os.path.join(album_dir, "_cornercrop_archive", "non_corner_watermark")
+            os.makedirs(reason_dir, exist_ok=True)
+            source_path = _create_test_image(os.path.join(reason_dir, "001.jpg"), 800, 600)
+            config = RecoveryConfig(
+                root=tmpdir,
+                state_dir=os.path.join(tmpdir, "state"),
+                dry_run=True,
+            )
+            regions = [
+                TextRegion("XIUREN", 0.9, 0.30, 0.92, 0.25, 0.05),
+                TextRegion("Copyright xiuren.com", 0.9, 0.30, 0.01, 0.25, 0.05),
+            ]
+
+            with mock.patch("cornercrop.non_corner_recovery._collect_text_regions", return_value=regions):
+                with mock.patch(
+                    "cornercrop.non_corner_recovery._verify_processed_image",
+                    return_value=(VerificationStatus.CLEAN, []),
+                ):
+                    result = recover_image(source_path, config)
+
+            self.assertEqual(result.action, "would_recover")
+            self.assertEqual(result.selected_profile, CropProfile.STRIP.value)
+            self.assertTrue(os.path.exists(source_path))
+
+
+class TestAdaptiveBatch(unittest.TestCase):
+    def test_process_batch_emits_heartbeat_before_completion(self):
+        callbacks = []
+
+        def worker(item):
+            time.sleep(0.06)
+            return item
+
+        results = process_batch(
+            [1],
+            worker,
+            AdaptiveParallelismConfig(
+                min_workers=1,
+                max_workers=1,
+                poll_interval=0.01,
+                progress_interval=100,
+                heartbeat_interval=0.01,
+            ),
+            progress_callback=lambda completed, total, target, snapshot: callbacks.append(
+                (completed, total, target)
+            ),
+        )
+
+        self.assertEqual(results, [1])
+        self.assertIn((0, 1, 1), callbacks)
+        self.assertIn((1, 1, 1), callbacks)
 
 
 if __name__ == "__main__":

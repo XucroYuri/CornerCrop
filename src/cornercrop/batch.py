@@ -43,6 +43,7 @@ class AdaptiveParallelismConfig:
     write_low_mbps: float = 60.0
     write_high_mbps: float = 180.0
     progress_interval: int = 25
+    heartbeat_interval: float = 30.0
 
 
 class ResourceMonitor(threading.Thread):
@@ -160,6 +161,7 @@ def process_batch(
     next_index = 0
     completed = 0
     target_workers = initial_target
+    last_progress_callback_at = time.monotonic()
 
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -186,6 +188,19 @@ def process_batch(
                     return_when=FIRST_COMPLETED,
                 )
                 if not done:
+                    now = time.monotonic()
+                    if (
+                        progress_callback
+                        and config.heartbeat_interval > 0
+                        and now - last_progress_callback_at >= config.heartbeat_interval
+                    ):
+                        progress_callback(
+                            completed,
+                            len(items),
+                            target_workers,
+                            monitor.latest(),
+                        )
+                        last_progress_callback_at = now
                     continue
 
                 for future in done:
@@ -205,6 +220,7 @@ def process_batch(
                             target_workers,
                             monitor.latest(),
                         )
+                        last_progress_callback_at = time.monotonic()
     finally:
         monitor.stop()
         monitor.join(timeout=1.0)

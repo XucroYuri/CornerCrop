@@ -24,11 +24,13 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Multimedia :: Graphics",
     "Topic :: Utilities",
 ]
 dependencies = [
     "Pillow>=9.0",
+    "psutil>=5.9",
     "pyobjc-framework-Vision>=10.0",
     "pyobjc-framework-Quartz>=10.0",
     "pyobjc-framework-CoreML>=10.0",
@@ -43,6 +45,8 @@ dev = [
 
 [project.scripts]
 cornercrop = "cornercrop.cli:main"
+cornercrop-library = "cornercrop.library_runner:main"
+cornercrop-recover-non-corner = "cornercrop.non_corner_recovery:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

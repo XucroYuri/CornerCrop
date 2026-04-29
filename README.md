@@ -1,13 +1,15 @@
 # CornerCrop
 
+[![CI](https://github.com/XucroYuri/CornerCrop/actions/workflows/ci.yml/badge.svg)](https://github.com/XucroYuri/CornerCrop/actions/workflows/ci.yml)
+
 macOS Vision-powered branding text detector, cropper, and verifier.
 
-CornerCrop uses Apple's native Vision.framework OCR to detect removable branding text and crop it out entirely on-device. It is built for both corner copyright lines and cover-page branding blocks such as `XIUREN`, issue IDs, and site URLs.
+CornerCrop uses Apple's native Vision.framework OCR to detect removable branding text and crop it out entirely on-device. It is built for both corner copyright lines and cover-page branding blocks such as known brand keywords, issue IDs, and site URLs.
 
 ## Features
 
 - **macOS-native OCR** — Uses Vision.framework for fast, local text detection
-- **Branding-aware rules** — Matches copyright, `xiuren`, URLs, and issue IDs before cropping
+- **Branding-aware rules** — Matches copyright text, known brand keywords, URLs, and issue IDs before cropping
 - **Auto cover detection** — Switches between standard strip crops and more aggressive cover-page crops
 - **Verification pass** — Re-runs OCR on processed output and reports residual branding text
 - **Batch support** — Accepts multiple files or whole directories
@@ -30,7 +32,7 @@ Or from source:
 ```bash
 git clone https://github.com/XucroYuri/CornerCrop.git
 cd CornerCrop
-pip install -e .
+python -m pip install -e ".[dev]"
 ```
 
 ## Usage
@@ -73,6 +75,45 @@ cornercrop ./photos --profile auto --verify --fail-on-residual
 cornercrop ./photos --report-json ./cornercrop-report.json
 ```
 
+### Large NAS Album Run
+
+For large NAS-backed image libraries, use the album-level runner instead of one huge recursive CLI
+invocation. It scans one top-level segment at a time, processes albums in parallel with resource
+backpressure, writes local resume state, and moves unsafe images into an album-local
+`_cornercrop_archive/` folder.
+
+```bash
+# Smoke-test decisions without modifying images
+cornercrop-library /path/to/image-library \
+  --state-dir runs/library-watermark/smoke \
+  --dry-run --max-album-workers 1
+
+# Start the long in-place run with conservative NAS I/O pressure
+scripts/start_library_cornercrop.sh /path/to/image-library
+
+# Use a faster local-Mac/NAS balance when the machine has headroom
+RESOURCE_PROFILE=balanced MAX_ALBUM_WORKERS=4 scripts/start_library_cornercrop.sh /path/to/image-library
+
+# Poll progress
+scripts/watch_library_cornercrop.py --watch --interval 60
+
+# Verify the DB state against the current non-archive image tree after completion
+scripts/audit_library_cornercrop.py /path/to/image-library
+
+# Gracefully stop after the current image
+touch runs/library-watermark/live/STOP
+```
+
+Policy: images with no detected watermark are skipped; corner watermarks are cropped in place when
+the retained image area stays above 70%; non-corner branding or crops that would remove more than
+30% of image area are moved into `_cornercrop_archive/`.
+
+Second-pass recovery for archived non-corner branding is available through
+`cornercrop-recover-non-corner` and `scripts/start_non_corner_recovery.sh`. It evaluates
+multiple crop profiles, verifies the cropped image again, and only moves clean results back to the
+parent album. See `docs/large-library-watermark-runbook.md` for the production runbook and audit
+checklist.
+
 ### Options
 
 ```text
@@ -94,6 +135,7 @@ options:
   --fail-on-residual   Return non-zero if verification still finds branding text
   --report-json PATH   Write summary + per-image results to JSON
   --dry-run            Detect and simulate crop only
+  --heartbeat-interval Progress heartbeat interval while long OCR tasks are in flight
   --json               Output per-image results as JSON
   --version            Show version
 ```
@@ -138,6 +180,26 @@ print(f"Verification: {result.verification_status}")
 - **Rectangular crops only** — Cannot do L-shaped or irregular removals
 - **macOS only** — Depends on Apple Vision.framework
 - **Aggressive cover crops are intentional** — Cover pages may lose more edge content in exchange for removing all branding text
+
+## Development
+
+```bash
+# Run the test suite
+uv run --extra dev pytest
+
+# Check the command-line entry points
+uv run python -m cornercrop.cli --help
+uv run python -m cornercrop.library_runner --help
+uv run python -m cornercrop.non_corner_recovery --help
+```
+
+Local images, run databases, audit exports, and private notes should stay out of Git. See
+`docs/privacy-and-local-data.md` before preparing public commits.
+
+## Contributing and Security
+
+Contributions are welcome. Please read `CONTRIBUTING.md` for development workflow and
+`SECURITY.md` for vulnerability reporting.
 
 ## Related Projects
 

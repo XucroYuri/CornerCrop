@@ -223,6 +223,12 @@ def main(argv=None):
         help="Emit progress every N completed images during large batch runs (default: 25)",
     )
     parser.add_argument(
+        "--heartbeat-interval",
+        type=_positive_float,
+        default=30.0,
+        help="Emit progress at least this often during long in-flight work (default: 30.0)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Detect and simulate crop only; do not save processed images",
@@ -742,6 +748,7 @@ def _adaptive_config_from_args(args) -> AdaptiveParallelismConfig:
         max_workers=args.max_workers,
         poll_interval=args.resource_poll_interval,
         progress_interval=args.progress_interval,
+        heartbeat_interval=args.heartbeat_interval,
         **profile_defaults,
     )
 
@@ -761,6 +768,7 @@ def _adaptive_config_to_dict(config: AdaptiveParallelismConfig) -> dict:
         "write_low_mbps": config.write_low_mbps,
         "write_high_mbps": config.write_high_mbps,
         "progress_interval": config.progress_interval,
+        "heartbeat_interval": config.heartbeat_interval,
     }
 
 
@@ -887,7 +895,7 @@ def _backup_original(item: InputItem, backup_dir: str) -> None:
 
 
 def _source_scoped_relative_path(item: InputItem) -> str:
-    """Prefix relative paths with a stable source-root token to avoid collisions."""
+    """Prefix relative paths with a stable source-root marker to avoid collisions."""
     relative_path = item.relative_path or os.path.basename(item.path)
     source_root = os.path.abspath(item.source_root)
     source_name = os.path.basename(os.path.normpath(source_root)) or "input"

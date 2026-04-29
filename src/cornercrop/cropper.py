@@ -21,7 +21,17 @@ COVER_SIDE_MAX_CROP_FRACTION = 0.25
 _BRANDING_PATTERNS = (
     ("copyright", re.compile(r"copyright", re.IGNORECASE)),
     ("rights", re.compile(r"all\s+rights\s+reserved", re.IGNORECASE)),
-    ("brand", re.compile(r"xiuren(?:\.com)?", re.IGNORECASE)),
+    (
+        "brand",
+        re.compile(
+            r"(?:xiuren|xiu\s*ren|xingyan|hua\s*yang|huayang|mf\s*star|mfstar|"
+            r"my\s*girl|mygirl|yi\s*tu\s*yu|yituyu|fei\s*lin|feilin|you\s*mi|"
+            r"youmi|mi\s*star|mistar|ugirls?|imiss|bo\s*loli|bololi|toutiao|"
+            r"\u79c0\u4eba|\u661f\u989c\u793e|\u82b1\u6f3e|\u6a21\u8303\u5b66\u9662|"
+            r"\u827a\u56fe\u8bed)",
+            re.IGNORECASE,
+        ),
+    ),
     ("url", re.compile(r"https?://\S*xiuren\.com/?", re.IGNORECASE)),
     ("issue_id", re.compile(r"\bxr[0-9a-z]{6,}\b", re.IGNORECASE)),
 )
